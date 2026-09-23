@@ -1,10 +1,11 @@
 /**
  * 字体覆盖率实验台 —— 前端主逻辑（原生 ESM，无框架）。
  */
-import { api, downloadJson, escapeHtml, fmtNum } from './api.js';
+import { api, downloadJson, downloadText, escapeHtml, fmtNum } from './api.js';
 import { GlyphDetector, groupResults, STATUS_LABELS } from './detector.js';
 import { parseRangeSpec, formatSegments, toHex, PRESET_NAMES } from '/shared/ranges.js';
 import { planFonts, countSegments } from '/shared/font-planner.js';
+import { buildWebfontCss } from '/shared/webfont-css.js';
 
 const state = {
   fonts: [],
@@ -12,6 +13,9 @@ const state = {
   coverageDoc: null,
   compareDoc: null,
   planDoc: null,
+  /** 本次规划所依据的字体库存签名（id/sha/cmap），变化后 CSS 规则即过期 */
+  planFontSig: null,
+  planStale: false,
   running: false,
 };
 
@@ -70,7 +74,33 @@ async function loadFonts(selectId) {
       state.fonts.map((f) => `<option value="${f.id}">${escapeHtml(fontLabel(f))}</option>`).join('');
     if (prev) sel.value = prev;
   }
+  markPlanStaleIfFontsChanged();
   refreshPlanFontCount();
+}
+
+/** 字体库存签名：上传 / 删除字体后会变化，已生成的 CSS 规则随即过期 */
+function fontInventorySignature(fonts) {
+  return (fonts || [])
+    .map((f) => `${f.id}:${f.sha256 || ''}:${f.cmapTotal || 0}`)
+    .sort()
+    .join('|');
+}
+
+/**
+ * 字体上传 / 删除 / 列表刷新后检查：当前规划结果若已存在，则标记为过期——
+ * 必须重新「开始规划」才能生成新的 @font-face 规则。
+ */
+function markPlanStaleIfFontsChanged() {
+  if (!state.planDoc) return;
+  const sig = fontInventorySignature(state.fonts);
+  state.planStale = sig !== state.planFontSig;
+  if (state.planStale) {
+    // 结果区当前正在展示该规划（含旧 CSS），就地刷新过期提示
+    const resultBox = $('#plan-result');
+    resultBox.querySelectorAll('[data-plan-stale-banner]').forEach((el) => el.classList.remove('hidden'));
+    const cssCard = resultBox.querySelector('[data-webfont-card]');
+    cssCard?.classList.add('stale');
+  }
 }
 
 function refreshPlanFontCount() {
@@ -658,11 +688,12 @@ function runPlan() {
   }
   warnBox.innerHTML = parsed.warnings.map((w) => `<div>⚠ ${escapeHtml(w)}</div>`).join('');
 
+  const generatedAt = new Date().toISOString();
   const doc = {
     reportType: 'font-pairing-plan',
     schemaVersion: 1,
-    title: `字体搭配规划 ${new Date().toISOString().slice(0, 10)}`,
-    generatedAt: new Date().toISOString(),
+    title: `字体搭配规划 ${generatedAt.slice(0, 10)}`,
+    generatedAt,
     basis: 'cmap-declared',
     request: {
       rangeInput,
@@ -684,9 +715,16 @@ function runPlan() {
     rounds: plan.rounds,
     remainingSegments: plan.remainingSegments,
     remainingCount: countSegments(plan.remainingSegments),
+    // 网页字体 CSS 依据：字体文件接口源与默认共用字体族名
+    webfont: {
+      baseUrl: window.location.origin,
+      family: 'FCB Pairing',
+    },
     caveats: [PLAN_CAVEAT],
   };
   state.planDoc = doc;
+  state.planFontSig = fontInventorySignature(state.fonts);
+  state.planStale = false;
   renderPlan(doc, resultBox);
   resultBox.classList.remove('hidden');
 }
@@ -765,6 +803,10 @@ function renderPlan(doc, container) {
         ${stat('blue', s.eligibleFonts, '含 cmap 候选字体')}
       </div>
       <div class="stop-banner ${stop.warn ? 'warn' : ''}">${escapeHtml(stop.text)}</div>
+      <div class="stop-banner warn hidden" data-plan-stale-banner>
+        ⚠ 字体库在本次规划之后发生变化（上传 / 删除 / 刷新），下面的规划结果与网页字体 CSS
+        可能引用了已删除或新增的字体；<strong>请重新点击「开始规划」</strong>后再使用 CSS。
+      </div>
       <div class="env-box">
         范围：${escapeHtml(doc.request.rangesText.slice(0, 400))}${doc.request.rangesText.length > 400 ? ' …' : ''}
         ｜ 共 ${fmtNum(doc.request.count)} 码位
@@ -780,6 +822,8 @@ function renderPlan(doc, container) {
       ${table}
     </div>
 
+    ${renderWebfontCard(doc)}
+
     <div class="card" style="margin-top:18px">
       <h2>仍未覆盖的区间 <span class="badge">${fmtNum(doc.remainingCount)} 码位</span></h2>
       ${remainingBlock}
@@ -791,6 +835,121 @@ function renderPlan(doc, container) {
     downloadJson(doc, `${doc.title.replace(/[^\w一-龥.-]+/g, '_')}.json`);
     toast('JSON 已导出');
   });
+
+  bindWebfontCard(doc, container);
+
+  if (state.planStale) {
+    container.querySelectorAll('[data-plan-stale-banner]').forEach((el) => el.classList.remove('hidden'));
+    container.querySelector('[data-webfont-card]')?.classList.add('stale');
+  }
+}
+
+/** 网页字体 CSS 卡片：同一字体族、按轮次分片的 @font-face 规则 */
+function renderWebfontCard(doc) {
+  const wf = doc.webfont || {};
+  const family = wf.family || 'FCB Pairing';
+  const baseUrl = wf.baseUrl || window.location.origin;
+  const noRounds = !doc.rounds.length;
+
+  return `
+    <div class="card webfont-card" style="margin-top:18px" data-webfont-card>
+      <div class="row-between" style="margin-top:0">
+        <h2 style="margin:0">网页字体 CSS（@font-face）
+          <span class="badge">同字体族 · 按轮次分片</span>
+        </h2>
+        <div class="actions" style="margin:0">
+          <button class="ghost" data-copy-css ${noRounds ? 'disabled' : ''}>复制 CSS</button>
+          <button class="primary" data-download-css ${noRounds ? 'disabled' : ''}>下载 .css</button>
+        </div>
+      </div>
+      <div class="webfont-notes">
+        <div>① <strong>src 依赖本站字体文件地址</strong>：<code>${escapeHtml(baseUrl)}/api/fonts/&lt;id&gt;/file</code>，
+          即「字体库」中当前的原始字体文件；站点不可访问或迁移地址后需自行改写。</div>
+        <div>② <strong>unicode-range 仅依据 cmap 声明</strong>切分：每条规则只含该轮<strong>首次新增覆盖</strong>
+          的码位，跨规则互不交叠；规划未覆盖的码位不会写入 CSS；不代表字形可真实渲染。</div>
+        <div>③ 所有规则共用一个字体族名，浏览器会按页面字符的码位自动选择对应字体分片；
+          仍未覆盖的码位由 <code>font-family</code> 栈中的后备字体承担。</div>
+        <div>④ 字体<strong>刷新（上传 / 删除）后，旧规则可能失效</strong>（字体 ID 变化或文件消失），
+          请重新点击「开始规划」再生成。</div>
+      </div>
+      <label class="select-label" style="margin-top:12px">共用字体族名（font-family，可修改后即时刷新预览）：
+        <input type="text" id="webfont-family" value="${escapeHtml(family)}" />
+      </label>
+      ${noRounds
+        ? '<div class="env-box">本次规划没有任何字体入选，无 @font-face 规则可生成；请调整目标范围或上传更多字体后重新规划。</div>'
+        : `<pre class="css-preview" data-css-preview spellcheck="false"></pre>
+           <div class="hint" style="margin-top:8px">
+             使用方式：将本文件随页面一起发布后，在自身 CSS 中写
+             <code data-css-family-usage>font-family: ${escapeHtml(family)}, 系统后备字体;</code>。
+           </div>`}
+    </div>
+  `;
+}
+
+/** 绑定 CSS 卡片的预览刷新、复制与下载 */
+function bindWebfontCard(doc, container) {
+  const card = container.querySelector('[data-webfont-card]');
+  if (!card) return;
+  const pre = card.querySelector('[data-css-preview]');
+  const input = card.querySelector('#webfont-family');
+
+  const build = () => {
+    const family = input?.value.trim() || 'FCB Pairing';
+    return buildWebfontCss(doc.rounds, {
+      family,
+      baseUrl: doc.webfont?.baseUrl || window.location.origin,
+      generatedAt: doc.generatedAt,
+    });
+  };
+  const refresh = () => {
+    if (!pre) return;
+    try {
+      pre.textContent = build();
+    } catch (err) {
+      pre.textContent = `/* CSS 生成失败：${err.message} */`;
+    }
+  };
+  if (input) {
+    input.addEventListener('input', () => {
+      doc.webfont = doc.webfont || {};
+      doc.webfont.family = input.value;
+      const usage = card.querySelector('[data-css-family-usage]');
+      if (usage) usage.textContent = `font-family: ${input.value.trim() || 'FCB Pairing'}, 系统后备字体;`;
+      refresh();
+    });
+  }
+  refresh();
+
+  card.querySelector('[data-copy-css]')?.addEventListener('click', async () => {
+    if (!pre) return;
+    try {
+      await copyText(pre.textContent);
+      toast('CSS 已复制到剪贴板');
+    } catch (err) {
+      toast('复制失败：' + err.message, true);
+    }
+  });
+
+  card.querySelector('[data-download-css]')?.addEventListener('click', () => {
+    if (!pre) return;
+    const filename = `font-pairing-${doc.generatedAt.slice(0, 10)}.css`;
+    downloadText(pre.textContent, filename, 'text/css;charset=utf-8');
+    toast('CSS 已下载');
+  });
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
+  // 非安全上下文（如纯 HTTP 局域网访问）兜底
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  ta.remove();
+  if (!ok) throw new Error('当前浏览器不允许自动复制，请手动全选复制');
 }
 
 /* ---------------- 报告库 ---------------- */

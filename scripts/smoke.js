@@ -3,10 +3,11 @@
  * 用法：node scripts/smoke.js
  */
 import assert from 'node:assert/strict';
-import { parseRangeSpec, formatSegments, subtractSegments, intersectSegments, PRESETS } from '../shared/ranges.js';
+import { parseRangeSpec, formatSegments, subtractSegments, intersectSegments, mergeSegments, PRESETS } from '../shared/ranges.js';
 import { scriptOf } from '../shared/scripts.js';
 import { compressCodepoints, sniffFormat } from '../server/font-parser.js';
 import { planFonts, countSegments } from '../shared/font-planner.js';
+import { buildWebfontCss, formatUnicodeRanges, cssHex, quoteFontFamily } from '../shared/webfont-css.js';
 
 // 范围解析
 assert.deepEqual(parseRangeSpec('U+41').segments, [[0x41, 0x41]]);
@@ -154,6 +155,85 @@ assert.deepEqual(
   // maxFonts 非法值报错
   assert.throws(() => planFonts(target, [F1], 0), /不小于 1/);
   assert.throws(() => planFonts(target, [F1], 1.5), /不小于 1/);
+}
+
+// 网页字体 CSS 生成
+{
+  const target = [[0x41, 0x50]];
+  const F1 = { id: 1, fullName: 'F1', format: 'ttf', cmapRanges: [[0x41, 0x48]] };
+  const F2 = { id: 2, fullName: 'F2', format: 'woff2', cmapRanges: [[0x45, 0x4c]] };
+  const F3 = { id: 3, fullName: 'F3', format: 'otf/ttc', cmapRanges: [[0x4d, 0x50]] };
+  const plan = planFonts(target, [F3, F2, F1], 5);
+
+  // 不变量：各轮 gainSegments 互不交叠，合并后恰好是覆盖集合（不包含未覆盖码位）
+  const union = mergeSegments(plan.rounds.flatMap((r) => r.gainSegments));
+  assert.deepEqual(union, mergeSegments([[0x41, 0x50]]));
+  assert.equal(countSegments(union), plan.covered);
+  assert.equal(intersectSegments(union, plan.remainingSegments).length, 0);
+
+  const css = buildWebfontCss(plan.rounds, {
+    family: 'My Stack',
+    baseUrl: 'http://localhost:3000/',
+    generatedAt: '2026-09-23T00:00:00.000Z',
+  });
+
+  // 每个入选字体一条规则，共用同一字体族
+  const faces = css.match(/@font-face \{/g) || [];
+  assert.equal(faces.length, 3);
+  assert.equal(css.match(/font-family: "My Stack";/g).length, 3);
+  // src 指向现有字体文件接口，带正确的 format 提示
+  assert.match(css, /src: url\("http:\/\/localhost:3000\/api\/fonts\/1\/file"\) format\("truetype"\)/);
+  assert.match(css, /src: url\("http:\/\/localhost:3000\/api\/fonts\/2\/file"\) format\("woff2"\)/);
+  // otf/ttc 轮廓不明，不标注 format()
+  assert.match(css, /src: url\("http:\/\/localhost:3000\/api\/fonts\/3\/file"\);/);
+  // unicode-range 只含该轮分配的码位（不含其他轮 / 未覆盖区间）
+  assert.match(css, /unicode-range: U\+0041-U\+0048;/);
+  assert.match(css, /unicode-range: U\+0049-U\+004C;/);
+  assert.match(css, /unicode-range: U\+004D-U\+0050;/);
+  // 头注释标明依赖与依据
+  assert.match(css, /\/api\/fonts\/:id\/file/);
+  assert.match(css, /cmap/);
+
+  // baseUrl 为空 → 根相对地址
+  const cssRoot = buildWebfontCss(plan.rounds, { baseUrl: '' });
+  assert.match(cssRoot, /url\("\/api\/fonts\/1\/file"\)/);
+
+  // 默认字体族名（输入为空 / 缺失时兜底）
+  assert.equal(quoteFontFamily(''), '"FCB Pairing"');
+  assert.equal(quoteFontFamily('   '), '"FCB Pairing"');
+  // 族名中的引号 / 反斜杠被转义
+  assert.equal(quoteFontFamily('A"B\\C'), '"A\\"B\\\\C"');
+
+  // 十六进制格式：BMP 补零到 4 位，增补平面保留 5-6 位
+  assert.equal(cssHex(0x41), 'U+0041');
+  assert.equal(cssHex(0x20000), 'U+20000');
+  assert.equal(formatUnicodeRanges([[0x41, 0x41], [0x43, 0x44]]), 'U+0041, U+0043-U+0044');
+
+  // maxFonts=1 时第 2 个区间不入选：未覆盖码位不得出现在 CSS
+  const capped = planFonts(target, [F3, F2, F1], 1);
+  const cappedCss = buildWebfontCss(capped.rounds, {});
+  assert.match(cappedCss, /unicode-range: U\+0041-U\+0048;/);
+  assert.doesNotMatch(cappedCss, /U\+0049/);
+  assert.doesNotMatch(cappedCss, /U\+0050/);
+
+  // 交叠码位不可被多条规则重复声明 → 直接抛错
+  const overlappingRounds = [
+    { order: 1, fontId: 1, gainSegments: [[0x41, 0x48]] },
+    { order: 2, fontId: 2, gainSegments: [[0x48, 0x50]] }, // U+0048 重复
+  ];
+  assert.throws(() => buildWebfontCss(overlappingRounds), /码位交叠/);
+
+  // 非法区间 / 缺少字体 ID 抛错
+  assert.throws(
+    () => buildWebfontCss([{ order: 1, fontId: 1, gainSegments: [[0x50, 0x41]] }]),
+    /非法区间/,
+  );
+  assert.throws(
+    () => buildWebfontCss([{ order: 1, fontId: 0, gainSegments: [[0x41, 0x42]] }]),
+    /字体 ID/,
+  );
+  // 空轮次：只输出说明注释，不输出任何规则
+  assert.equal((buildWebfontCss([]).match(/@font-face \{/g) || []).length, 0);
 }
 
 console.log('smoke tests passed ✓');

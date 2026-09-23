@@ -47,9 +47,12 @@ export const api = {
 
 /** 浏览器本地下载任意 JSON 对象 */
 export function downloadJson(obj, filename) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], {
-    type: 'application/json;charset=utf-8',
-  });
+  downloadText(JSON.stringify(obj, null, 2), filename, 'application/json;charset=utf-8');
+}
+
+/** 浏览器本地下载任意文本（JSON / CSS 等） */
+export function downloadText(text, filename, mime = 'text/plain;charset=utf-8') {
+  const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

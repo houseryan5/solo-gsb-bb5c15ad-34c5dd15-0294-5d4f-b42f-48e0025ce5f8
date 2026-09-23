@@ -291,6 +291,28 @@ footer {
 }
 .cmap-note strong { color: var(--amber); }
 
+/* 网页字体 CSS */
+.webfont-card .webfont-notes {
+  margin-top: 12px; padding: 10px 14px; border-radius: 8px;
+  background: var(--bg-soft); border: 1px solid var(--border);
+  color: var(--muted); font-size: 12.5px; line-height: 1.8;
+}
+.webfont-card .webfont-notes code,
+.webfont-card .hint code { color: var(--accent); font-family: var(--mono); }
+.css-preview {
+  margin: 12px 0 0; background: #0c111d; border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px 16px; color: #cdd9f2;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+  max-height: 420px; overflow: auto; white-space: pre; word-break: normal;
+}
+.webfont-card.stale { border-color: rgba(251,191,36,.45); }
+.webfont-card.stale h2::after {
+  content: "规则可能已过期"; display: inline-block; margin-left: 8px;
+  font-size: 11px; padding: 1px 8px; border-radius: 99px;
+  background: var(--amber-soft); border: 1px solid rgba(251,191,36,.35); color: var(--amber);
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
 @media (max-width: 900px) {
   .grid.two, .grid.three { grid-template-columns: 1fr; }
   .plan-form { grid-template-columns: 1fr; }
