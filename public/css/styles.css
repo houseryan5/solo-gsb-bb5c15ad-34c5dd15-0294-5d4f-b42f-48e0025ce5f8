@@ -290,6 +290,13 @@ footer {
   border-radius: 8px; padding: 10px 14px; color: var(--amber); font-size: 12.5px;
 }
 .cmap-note strong { color: var(--amber); }
+.cmap-note code { font-family: var(--mono); font-size: 12px; }
+.css-preview {
+  margin: 12px 0 0; background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px; font-family: var(--mono);
+  font-size: 12.5px; line-height: 1.65; color: var(--text);
+  max-height: 340px; overflow: auto; white-space: pre;
+}
 
 @media (max-width: 900px) {
   .grid.two, .grid.three { grid-template-columns: 1fr; }

@@ -1,10 +1,11 @@
 /**
  * 字体覆盖率实验台 —— 前端主逻辑（原生 ESM，无框架）。
  */
-import { api, downloadJson, escapeHtml, fmtNum } from './api.js';
+import { api, downloadJson, downloadText, escapeHtml, fmtNum } from './api.js';
 import { GlyphDetector, groupResults, STATUS_LABELS } from './detector.js';
 import { parseRangeSpec, formatSegments, toHex, PRESET_NAMES } from '/shared/ranges.js';
 import { planFonts, countSegments } from '/shared/font-planner.js';
+import { planToWebfont } from '/shared/webfont-css.js';
 
 const state = {
   fonts: [],
@@ -71,6 +72,23 @@ async function loadFonts(selectId) {
     if (prev) sel.value = prev;
   }
   refreshPlanFontCount();
+  invalidatePlan();
+}
+
+/**
+ * 字体列表变化（上传 / 刷新 / 删除）后，此前的搭配方案与 @font-face 规则即失效：
+ * 清空结果并要求重新「开始规划」才能生成新规则。
+ */
+function invalidatePlan() {
+  if (!state.planDoc) return;
+  state.planDoc = null;
+  const box = $('#plan-result');
+  box.innerHTML = `
+    <div class="card"><div class="env-box" style="margin-top:0">
+      字体列表已变化：此前的搭配方案与 @font-face 规则已失效，
+      请重新点击「开始规划」生成新的搭配方案与 CSS 规则。
+    </div></div>`;
+  box.classList.remove('hidden');
 }
 
 function refreshPlanFontCount() {
@@ -686,6 +704,8 @@ function runPlan() {
     remainingCount: countSegments(plan.remainingSegments),
     caveats: [PLAN_CAVEAT],
   };
+  // 按各轮首次新增覆盖区间生成 @font-face 规则（仅 cmap 声明，规则间互不交叠）
+  doc.webfont = planToWebfont(doc);
   state.planDoc = doc;
   renderPlan(doc, resultBox);
   resultBox.classList.remove('hidden');
@@ -785,12 +805,62 @@ function renderPlan(doc, container) {
       ${remainingBlock}
       ${renderCaveats(doc.caveats)}
     </div>
+
+    ${renderWebfontCard(doc)}
   `;
 
   container.querySelector('[data-export-plan]')?.addEventListener('click', () => {
     downloadJson(doc, `${doc.title.replace(/[^\w一-龥.-]+/g, '_')}.json`);
     toast('JSON 已导出');
   });
+
+  const cssFileName = () => `${doc.title.replace(/[^\w一-龥.-]+/g, '_')}.css`;
+  container.querySelector('[data-download-css]')?.addEventListener('click', () => {
+    downloadText(doc.webfont.css, cssFileName(), 'text/css;charset=utf-8');
+    toast('CSS 已导出');
+  });
+  container.querySelector('[data-copy-css]')?.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(doc.webfont.css);
+      toast('CSS 已复制到剪贴板');
+    } catch {
+      toast('复制失败：浏览器未授权剪贴板访问', true);
+    }
+  });
+}
+
+/** 网页字体 CSS 卡片：预览 + 下载，并标明规则依赖与依据 */
+function renderWebfontCard(doc) {
+  const wf = doc.webfont;
+  if (!wf || !wf.ruleCount) {
+    return `
+    <div class="card" style="margin-top:18px">
+      <h2>网页字体 CSS（@font-face）</h2>
+      <div class="env-box" style="margin-top:6px">没有字体入选，未生成任何 @font-face 规则。</div>
+    </div>`;
+  }
+  return `
+    <div class="card" style="margin-top:18px">
+      <div class="row-between">
+        <h2 style="margin:0">网页字体 CSS（@font-face）
+          <span class="badge">${wf.ruleCount} 条规则 · ${wf.families.length} 个字体族</span>
+        </h2>
+        <div class="actions" style="margin:0">
+          <button class="ghost" data-copy-css>复制 CSS</button>
+          <button class="primary" data-download-css>下载 CSS</button>
+        </div>
+      </div>
+      <div class="cmap-note">
+        <strong>⚠ 规则依赖本站字体文件地址，且仅依据 cmap 声明。</strong>
+        每个入选字体按其该轮「首次新增覆盖区间」生成同一字体族（font-family 相同）的规则，
+        <code>src</code> 指向本站字体文件接口 <code>/api/fonts/&lt;id&gt;/file</code>，
+        仅在能通过该地址访问字体文件的环境（如同源部署本站）中生效；
+        <code>unicode-range</code> 仅含该轮分配的码位（仅 cmap 声明，不代表真实渲染），
+        各规则互不交叠，未覆盖区间未写入。
+        刷新或删除字体后，需重新「开始规划」才能生成新规则。
+      </div>
+      <pre class="css-preview"><code>${escapeHtml(wf.css)}</code></pre>
+    </div>`;
 }
 
 /* ---------------- 报告库 ---------------- */

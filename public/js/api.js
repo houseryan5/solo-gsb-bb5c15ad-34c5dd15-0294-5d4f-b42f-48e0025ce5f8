@@ -45,11 +45,9 @@ export const api = {
   exportUrl: (id) => `/api/reports/${id}/export`,
 };
 
-/** 浏览器本地下载任意 JSON 对象 */
-export function downloadJson(obj, filename) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], {
-    type: 'application/json;charset=utf-8',
-  });
+/** 浏览器本地下载任意文本内容 */
+export function downloadText(text, filename, mime = 'text/plain;charset=utf-8') {
+  const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -58,6 +56,11 @@ export function downloadJson(obj, filename) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/** 浏览器本地下载任意 JSON 对象 */
+export function downloadJson(obj, filename) {
+  downloadText(JSON.stringify(obj, null, 2), filename, 'application/json;charset=utf-8');
 }
 
 export function escapeHtml(s) {

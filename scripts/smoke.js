@@ -3,10 +3,13 @@
  * 用法：node scripts/smoke.js
  */
 import assert from 'node:assert/strict';
-import { parseRangeSpec, formatSegments, subtractSegments, intersectSegments, PRESETS } from '../shared/ranges.js';
+import { parseRangeSpec, formatSegments, subtractSegments, intersectSegments, mergeSegments, PRESETS } from '../shared/ranges.js';
 import { scriptOf } from '../shared/scripts.js';
 import { compressCodepoints, sniffFormat } from '../server/font-parser.js';
 import { planFonts, countSegments } from '../shared/font-planner.js';
+import {
+  planToWebfont, fontFileUrl, cssFamilyName, unicodeRangeValue, formatHint,
+} from '../shared/webfont-css.js';
 
 // 范围解析
 assert.deepEqual(parseRangeSpec('U+41').segments, [[0x41, 0x41]]);
@@ -154,6 +157,107 @@ assert.deepEqual(
   // maxFonts 非法值报错
   assert.throws(() => planFonts(target, [F1], 0), /不小于 1/);
   assert.throws(() => planFonts(target, [F1], 1.5), /不小于 1/);
+}
+
+// 网页字体 CSS（@font-face）生成
+{
+  /** 从 CSS 中解析全部 unicode-range 声明区间 */
+  function declaredSegments(css) {
+    return [...css.matchAll(/unicode-range:\s*([^;]+);/g)].flatMap((m) =>
+      m[1].split(',').map((tok) => {
+        const mm = tok.trim().match(/^U\+([0-9A-F]+)(?:-([0-9A-F]+))?$/i);
+        assert.ok(mm, `无法解析 unicode-range 片段：${tok}`);
+        return [parseInt(mm[1], 16), parseInt(mm[2] ?? mm[1], 16)];
+      }));
+  }
+  /** 交叠码位不可被多条规则重复声明：合并后总数须等于各段之和 */
+  function assertDisjoint(css) {
+    const segs = declaredSegments(css);
+    const sum = segs.reduce((n, [lo, hi]) => n + hi - lo + 1, 0);
+    assert.equal(countSegments(mergeSegments(segs)), sum, 'unicode-range 存在交叠');
+    return segs;
+  }
+
+  // 小工具
+  assert.equal(fontFileUrl(7), '/api/fonts/7/file');
+  assert.equal(unicodeRangeValue([[0x41, 0x41]]), 'U+0041');
+  assert.equal(unicodeRangeValue([[0x41, 0x48], [0x50, 0x50]]), 'U+0041-0048, U+0050');
+  assert.equal(cssFamilyName(3, 'A "B" \\ {C}'), 'FCB Plan #3 A B C');
+  assert.equal(formatHint('ttf'), 'truetype');
+  assert.equal(formatHint('woff2'), 'woff2');
+  assert.equal(formatHint('otf/ttc'), null);
+
+  // 基于规划结果生成：src 指向本站字体文件接口，unicode-range 仅含各轮分配码位
+  const target = [[0x41, 0x50]]; // 16 码位
+  const F1 = { id: 1, fullName: 'F1', format: 'ttf', cmapRanges: [[0x41, 0x48]] };
+  const F2 = { id: 2, fullName: 'F2', format: 'woff2', cmapRanges: [[0x45, 0x4c]] };
+  const F3 = { id: 3, fullName: 'F3', format: 'otf/ttc', cmapRanges: [[0x4d, 0x50]] };
+  const plan = planFonts(target, [F1, F2, F3], 5);
+  const wf = planToWebfont({
+    rounds: plan.rounds,
+    generatedAt: '2026-09-26T00:00:00.000Z',
+    request: { rangesText: 'U+0041-0050', count: 16 },
+  });
+  assert.equal(wf.ruleCount, 3);
+  assert.equal(wf.families.length, 3);
+  // src 指向本站字体文件接口；format() 按容器映射，otf/ttc 不带 format()
+  assert.ok(wf.css.includes('src: url("/api/fonts/1/file") format("truetype");'));
+  assert.ok(wf.css.includes('src: url("/api/fonts/2/file") format("woff2");'));
+  assert.ok(wf.css.includes('src: url("/api/fonts/3/file");'));
+  // 每个入选字体使用同一字体族名
+  assert.ok(wf.css.includes('font-family: "FCB Plan #1 F1";'));
+  assert.ok(wf.css.includes('font-family: "FCB Plan #2 F2";'));
+  // unicode-range 仅含该轮分配码位（F2 与 F1 交叠部分只归 F1）
+  assert.ok(wf.css.includes('unicode-range: U+0041-0048;'));
+  assert.ok(wf.css.includes('unicode-range: U+0049-004C;'));
+  assert.ok(wf.css.includes('unicode-range: U+004D-0050;'));
+  // 声明区间互不交叠，且恰好覆盖整个目标范围
+  assert.deepEqual(mergeSegments(assertDisjoint(wf.css)), [[0x41, 0x50]]);
+
+  // 未覆盖区间不得写入 CSS：限制 1 个字体时剩余 0x49-0x50 不得出现
+  const capped = planToWebfont({ rounds: planFonts(target, [F1, F2, F3], 1).rounds });
+  assert.deepEqual(mergeSegments(assertDisjoint(capped.css)), [[0x41, 0x48]]);
+  assert.ok(!capped.css.includes('U+0049'));
+  assert.ok(!capped.css.includes('U+0050'));
+
+  // 同一字体多个新增区间 → 多条规则共用同一 font-family
+  const multi = planFonts([[0x41, 0x43], [0x50, 0x52]], [
+    { id: 4, fullName: 'Multi', format: 'ttf', cmapRanges: [[0x41, 0x43], [0x50, 0x52]] },
+  ], 3);
+  const wfMulti = planToWebfont({ rounds: multi.rounds });
+  assert.equal(wfMulti.ruleCount, 2);
+  assert.equal(wfMulti.css.split('font-family: "FCB Plan #4 Multi";').length - 1, 2);
+  assert.ok(wfMulti.css.includes('unicode-range: U+0041-0043;'));
+  assert.ok(wfMulti.css.includes('unicode-range: U+0050-0052;'));
+  assertDisjoint(wfMulti.css);
+
+  // 防御：即使输入的轮次区间交叠，输出也不会重复声明同一码位
+  const overlap = planToWebfont({
+    rounds: [
+      { order: 1, fontId: 1, fontName: 'A', format: 'ttf', gainSegments: [[0x41, 0x48]] },
+      { order: 2, fontId: 2, fontName: 'B', format: 'ttf', gainSegments: [[0x45, 0x4c]] },
+    ],
+  });
+  assert.ok(overlap.css.includes('unicode-range: U+0049-004C;'));
+  assert.ok(!overlap.css.includes('U+0045'));
+  assertDisjoint(overlap.css);
+
+  // 字体名中的引号被清洗、注释定界符被拆开（不破坏 CSS 结构）
+  const evil = planToWebfont({
+    rounds: [
+      { order: 1, fontId: 9, fontName: 'X */ inject /* "Y"', format: 'ttf', gainSegments: [[0x41, 0x41]] },
+    ],
+  });
+  assert.ok(evil.css.includes('X * / inject / * "Y"')); // 注释中的 */ 被拆开
+  assert.ok(evil.css.includes('font-family: "FCB Plan #9 X */ inject /* Y";')); // 引号已清洗
+  assertDisjoint(evil.css);
+
+  // 无入选字体：不生成规则
+  const none = planToWebfont({ rounds: [] });
+  assert.equal(none.ruleCount, 0);
+  assert.equal(none.families.length, 0);
+  assert.ok(none.css.includes('未生成'));
+  assert.equal(declaredSegments(none.css).length, 0);
 }
 
 console.log('smoke tests passed ✓');
